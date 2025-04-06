@@ -4,7 +4,7 @@ import time
 import os
 from datetime import datetime
 from flask import Flask
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, emit
 import base64
 import threading
 from zeroconf import ServiceInfo, Zeroconf
@@ -77,6 +77,8 @@ def camera_processing():
     last_notification_time = 0
     notification_cooldown = 5  # seconds
     min_confidence = 0.7  # Minimum confidence for DNN detection
+    last_frame_time = 0
+    frame_interval = 0.15  # ~7 FPS instead of 10
 
     print("Face detection system started. Press 'q' to quit.")
 
@@ -163,11 +165,35 @@ def camera_processing():
         faces_data = formatted_faces
         
         # Convert current frame to base64 for streaming
-        _, buffer = cv2.imencode('.jpg', frame)
-        current_frame_encoded = base64.b64encode(buffer).decode('utf-8')
+        # Send frame at regular intervals regardless of face detection
+        current_time = time.time()
+        if current_time - last_frame_time >= frame_interval:
+            # Higher quality, consistent compression
+            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 90]
+            
+            # Try to make the image smaller but clearer by scaling down if needed
+            max_width = 640  # Limit width for better network performance
+            if frame.shape[1] > max_width:
+                scale = max_width / frame.shape[1]
+                new_width = int(frame.shape[1] * scale)
+                new_height = int(frame.shape[0] * scale)
+                frame_resized = cv2.resize(frame, (new_width, new_height))
+                _, buffer = cv2.imencode('.jpg', frame_resized, encode_params)
+            else:
+                _, buffer = cv2.imencode('.jpg', frame, encode_params)
+            
+            current_frame_encoded = base64.b64encode(buffer).decode('utf-8')
+            
+            # Emit frame to all connected clients
+            socketio.emit('frame_update', {
+                'image': current_frame_encoded,
+                'faces': faces_data,
+                'timestamp': current_time
+            })
+            
+            last_frame_time = current_time
         
         # Check if faces were detected
-        current_time = time.time()
         if len(faces) > 0:
             if not face_detected or (current_time - last_notification_time > notification_cooldown):
                 print(f"ALERT: {len(faces)} face(s) detected!")
@@ -245,22 +271,39 @@ def camera_processing():
 def video_feed():
     return f'<img src="data:image/jpeg;base64,{current_frame_encoded}" />'
 
+@socketio.on('request_stream')
+def handle_stream_request():
+    print("Client requested video stream")
+    # Just acknowledge - actual streaming happens in camera_processing loop
+    emit('stream_acknowledged', {'status': 'streaming'})
+
+@socketio.on('set_quality')
+def handle_quality_change(data):
+    global frame_interval
+    quality = data.get('quality', 'medium')
+    print(f"Stream quality changed to {quality}")
+    
+    if quality == 'low':
+        frame_interval = 0.4  # ~2.5 FPS - extremely stable
+    elif quality == 'medium':
+        frame_interval = 0.25  # ~4 FPS - good balance
+    else:  # high
+        frame_interval = 0.18  # ~5.5 FPS - faster but may flicker on slower devices
+
 if __name__ == '__main__':
     # Start camera processing in a separate thread
     camera_thread = threading.Thread(target=camera_processing)
     camera_thread.daemon = True
     camera_thread.start()
     
-    # Start the Socket.io server
+    # Register mDNS/Zeroconf service
+    print("Registering service")
     zeroconf, service_info = register_service()
     print(f"Service registered - IP: {get_local_ip()}")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
     
-    # Unregister service and close zeroconf
-    try:
-        zeroconf.unregister_service(service_info)
-        zeroconf.close()
-    except Exception as e:
-        print(f"Error closing zeroconf: {e}")
-    finally:
-        print("Socket.io server closed") 
+    # Start Flask app
+    socketio.run(app, host='0.0.0.0', allow_unsafe_werkzeug=True)
+    
+    # Clean up on exit
+    zeroconf.unregister_service(service_info)
+    zeroconf.close() 
